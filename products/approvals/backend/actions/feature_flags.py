@@ -7,10 +7,12 @@ from django.db.models import Model
 
 from products.approvals.backend.actions.base import BaseAction
 from products.approvals.backend.exceptions import ApplyFailed, PreconditionFailed
-from products.approvals.backend.ownership import OWNER_KIND_UNOWNED, owner_kind_changed
+from products.approvals.backend.ownership import OWNER_KIND_UNOWNED, owner_in_scope, owner_kind_changed
 from products.feature_flags.backend.api.feature_flag import FeatureFlagSerializer
 from products.feature_flags.backend.models.feature_flag import FeatureFlag
 from products.feature_flags.backend.ownership import flag_owner_kind
+
+_NOT_DERIVED: Any = object()
 
 
 def _to_wire_form(value: Any) -> Any:
@@ -130,6 +132,35 @@ def _derive_flag_owner_kind(team, resource_id: Optional[str], intent_data: dict[
     return flag_owner_kind(flag) or OWNER_KIND_UNOWNED
 
 
+def _memoized_owner_kind(flag: Optional[FeatureFlag]) -> Optional[str]:
+    """Which product owns this flag, derived once per write.
+
+    The gate offers every family to the same change, so without this the derivation would read
+    all six owning relations once per family. The memo hangs on the flag instance, which the
+    detect loop passes to each action unchanged, and so lives exactly as long as the write.
+
+    A create has no flag yet and so no owner. That is not a hole: the flag a product mints is
+    unowned for the instant it is written, because the row that will own it does not exist yet,
+    so the unowned family is the only one that can see it.
+    """
+    if flag is None:
+        return None
+    cached = getattr(flag, "_approval_owner_kind", _NOT_DERIVED)
+    if cached is _NOT_DERIVED:
+        cached = flag_owner_kind(flag)
+        flag._approval_owner_kind = cached  # type: ignore[attr-defined]
+    return cached
+
+
+def _in_family_scope(flag: Optional[FeatureFlag], owner_scope: Optional[str], team) -> bool:
+    """Whether this action's family governs this flag, given which product owns it."""
+    return owner_in_scope(
+        owner_scope,
+        team.organization if team is not None else None,
+        lambda: _memoized_owner_kind(flag),
+    )
+
+
 def _check_flag_staleness(intent_data: dict[str, Any], context: Optional[dict[str, Any]] = None) -> bool:
     """Whether the flag moved out from under a pending change request.
 
@@ -226,6 +257,10 @@ class FeatureFlagActionBase(BaseAction):
     endpoint_serializer_class = FeatureFlagSerializer
     intent_fields = ["active"]
 
+    # Which product's flags this family governs, or None for the flags no product owns.
+    # `owner_in_scope` reads it; an owner-scoped subclass sets it.
+    owner_scope: Optional[str] = None
+
     # Subclasses define the target state
     target_active_state: bool
 
@@ -315,7 +350,7 @@ class FeatureFlagActionBase(BaseAction):
         if not team:
             return False
 
-        return True
+        return _in_family_scope(flag, cls.owner_scope, team)
 
     @classmethod
     def extract_intent(cls, request, view, *args, **kwargs) -> dict[str, Any]:
@@ -463,6 +498,9 @@ class UpdateFeatureFlagAction(BaseAction):
     description = "Update feature flag fields"
     resource_type = "feature_flag"
     endpoint_serializer_class = FeatureFlagSerializer
+
+    # Which product's flags this family governs, or None for the flags no product owns.
+    owner_scope: Optional[str] = None
 
     GATEABLE_FIELDS: dict[str, dict[str, str]] = {
         "rollout_percentage": {
@@ -614,7 +652,7 @@ class UpdateFeatureFlagAction(BaseAction):
         if not team:
             return False
 
-        return True
+        return _in_family_scope(flag, cls.owner_scope, team)
 
     @classmethod
     def extract_intent(cls, request, view, *args, **kwargs) -> dict[str, Any]:
